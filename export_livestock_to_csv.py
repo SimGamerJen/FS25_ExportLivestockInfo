@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-# Export livestock with genetics, pregnancy, weight, parent IDs, FarmID, birthday/country.
-# Reads ONLY: <save>/placeables.xml
+# Export FS2025 livestock (genetics, pregnancy, summaries, Excel/CSV)
 #
-# Extras:
-# - placeable_id, shed_type, species
-# - age_days, age_years, preg_due_date
-# - filters: --species cows,sheep,pigs  --farmid 2
-# - batch: --all-saves (exports every savegame*)
-# - summary CSV and/or XLSX (Animals, Fetuses, Summary sheets)
-# - country_name + country_iso from RealisticLivestock.lua AREA_CODES (or --country-map)
-# - respects gameSettings.xml <modsDirectoryOverride>
+# - Reads ONLY <save>/placeables.xml (no game files modified)
+# - Animals + Fetuses tables, plus Summary (by shed/species/breed)
+# - Derived: age_days, age_years, preg_due_date
+# - Country mapping: RealisticLivestock.lua AREA_CODES (or --country-map JSON)
+# - Respects gameSettings.xml <modsDirectoryOverride>
+# - Filters: --species cows,sheep,pigs  --farmid N
+# - Batch mode: --all-saves (exports every savegame*)
+# - Excel output (--xlsx) with proper numeric/date types; pre-1900 dates stay as text
 #
-# Run from .../My Games/FarmingSimulator2025:
-#   python export_livestock_to_csv.py -s savegame1 --xlsx
-#   python export_livestock_to_csv.py --all-saves --species cows,sheep --farmid 2 --xlsx
-#   python export_livestock_to_csv.py -s savegame3 -o reports/animals.csv --summary-out reports/summary.csv
-#   python export_livestock_to_csv.py -s savegame1 --country-map my_map.json  (JSON overrides RL)
-#   python export_livestock_to_csv.py -s savegame1 --rl "D:\Mods\FS25_RealisticLivestock.zip" --verbose
+# Usage (run from your FS25 folder):
+#   py export_livestock_to_csv.py --save savegame1 --xlsx --verbose
 
-import argparse, csv, json, os, re, sys, zipfile
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import zipfile
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -26,12 +27,12 @@ from typing import Dict, List, Optional, Tuple
 # ---------- Optional Excel support ----------
 try:
     from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
     OPENPYXL_OK = True
 except Exception:
     OPENPYXL_OK = False
 
-# ---------- Column definitions (deterministic order) ----------
-
+# ---------- Column definitions ----------
 ANIMAL_COLUMNS = [
     "placeable_id",
     "current_shed",
@@ -66,7 +67,7 @@ ANIMAL_COLUMNS = [
     "preg_duration",
     "preg_due_date",
     "preg_fetus_count",
-    # legacy placeholders (left blank)
+    # placeholders (not in placeables.xml, kept for compatibility)
     "purchase_date",
     "purchase_price",
 ]
@@ -115,8 +116,83 @@ SUMMARY_COLUMNS = [
     "total_fetuses",
 ]
 
-# ---------- Tiny XML helpers ----------
+# ---------- XLSX casting helpers (numbers & dates; pre-1900 stays text) ----------
 
+ANIMAL_INT_COLS = {
+    "birthday_day","birthday_month","birthday_year",
+    "preg_day","preg_month","preg_year","preg_duration","preg_fetus_count","age_days",
+    # NEW: cast IDs/codes to integers
+    "FarmID", "unique_id", "country",
+}
+
+ANIMAL_FLOAT_COLS = {
+    "age","age_years","weight","animal_health",
+    "animal_gen_metabolism","animal_gen_quality","animal_gen_health",
+    "animal_gen_fertility","animal_gen_productivity",
+}
+ANIMAL_DATE_COLS = {"preg_due_date"}
+
+FETUS_INT_COLS = {
+    "fetus_index","preg_day","preg_month","preg_year","preg_duration",
+    # NEW: mirror numeric casting for fetus sheet
+    "FarmID", "country", "mother_unique_id",
+}
+
+FETUS_FLOAT_COLS = {
+    "health","gen_metabolism","gen_quality","gen_health","gen_fertility","gen_productivity"
+}
+FETUS_DATE_COLS = {"due_date"}
+
+SUMMARY_INT_COLS = {"animals_count","pregnant_count","total_fetuses"}
+SUMMARY_FLOAT_COLS = {
+    "avg_age_months","avg_age_years","avg_health",
+    "avg_gen_metabolism","avg_gen_quality","avg_gen_health",
+    "avg_gen_fertility","avg_gen_productivity",
+}
+SUMMARY_DATE_COLS = set()
+
+def _to_int_or_none(v: str):
+    if v is None or v == "": return None
+    try:
+        f = float(v); i = int(round(f))
+        return i
+    except Exception:
+        return None
+
+def _to_float_or_none(v: str):
+    if v is None or v == "": return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def _excel_date_or_text(v: str):
+    """Return a real date object for Excel if year >= 1900; else return the original text or None."""
+    if v is None or v == "": return None
+    try:
+        d = date.fromisoformat(v)  # YYYY-MM-DD
+        if d.year >= 1900:
+            return d          # Excel-valid date -> real date object
+        else:
+            return v          # pre-1900 -> keep as TEXT to avoid negative serials / #####
+    except Exception:
+        return v              # not a valid ISO date -> keep as TEXT
+
+def _cast_for_sheet(row: dict, columns: list, int_cols: set, float_cols: set, date_cols: set):
+    out = []
+    for col in columns:
+        val = row.get(col, "")
+        if col in date_cols:
+            out.append(_excel_date_or_text(val))
+        elif col in int_cols:
+            out.append(_to_int_or_none(val))
+        elif col in float_cols:
+            out.append(_to_float_or_none(val))
+        else:
+            out.append(val if val != "" else None)
+    return out
+
+# ---------- Tiny XML helpers ----------
 def _basename_or(val: str, fallback: str = "") -> str:
     try: return os.path.basename(val) if val else fallback
     except Exception: return fallback
@@ -141,7 +217,6 @@ def _genetics(elem: Optional[ET.Element]) -> Dict[str, str]:
     }
 
 # ---------- Species detection & normalization ----------
-
 SPECIES_KEYS = {
     "cow": "cows", "cattle": "cows", "beef": "cows",
     "sheep": "sheep", "lamb": "sheep", "ovine": "sheep",
@@ -152,17 +227,14 @@ SPECIES_KEYS = {
 }
 
 def infer_species(placeable: ET.Element, shed_file: str, animal: ET.Element) -> str:
-    # explicit on animal?
     t = _get_attr(animal, "type") or _get_attr(animal, "animalType")
     if t:
         tl = t.lower()
         for k, v in SPECIES_KEYS.items():
             if k in tl: return v
-    # placeable type node
     pt = _text(_child(placeable, "type")).lower()
     for k, v in SPECIES_KEYS.items():
         if k and k in pt: return v
-    # filename heuristic
     lf = (shed_file or "").lower()
     for k, v in SPECIES_KEYS.items():
         if k and k in lf: return v
@@ -173,23 +245,18 @@ def normalize_species_list(s: str) -> List[str]:
     for raw in s.split(","):
         k = raw.strip().lower()
         if not k: continue
-        if k in SPECIES_KEYS.values():
-            out.append(k)
-        else:
-            out.append(SPECIES_KEYS.get(k, k))
+        out.append(k if k in SPECIES_KEYS.values() else SPECIES_KEYS.get(k, k))
     seen, res = set(), []
     for v in out:
         if v not in seen:
             seen.add(v); res.append(v)
     return res
 
-# ---------- Country mapping (RL) ----------
-
+# ---------- Country mapping (Realistic Livestock) ----------
 def _str_to_bool(s: str) -> bool:
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 def find_mods_dir(fs_root: str, verbose: bool = False) -> str:
-    """Use gameSettings.xml modsDirectoryOverride when active; else ./mods next to gameSettings.xml."""
     settings_path = os.path.join(fs_root, "gameSettings.xml")
     default_dir = os.path.join(fs_root, "mods")
     if not os.path.isfile(settings_path):
@@ -225,7 +292,6 @@ def _looks_like_rl_mod(name: str) -> bool:
     return ("realistic" in n and "livestock" in n) or n.startswith("fs25_realisticlivestock")
 
 def _brace_body(text: str, header: str) -> Optional[str]:
-    """Return the text inside the top-level braces after 'header' (brace-matched)."""
     i = text.find(header)
     if i < 0: return None
     j = text.find("{", i)
@@ -241,13 +307,11 @@ def _brace_body(text: str, header: str) -> Optional[str]:
     return None
 
 def _parse_area_codes_from_lua(lua_text: str) -> Tuple[Dict[str,str], Dict[str,str]]:
-    """Return (id->country_name, id->iso_code) by parsing AREA_CODES = { ... }."""
     body = _brace_body(lua_text, "AREA_CODES")
     if not body: return {}, {}
     name_map, iso_map = {}, {}
     for entry in re.finditer(r'\[\s*(\d+)\s*\]\s*=\s*{(.*?)}', body, flags=re.S):
-        idx = entry.group(1)
-        sub = entry.group(2)
+        idx = entry.group(1); sub = entry.group(2)
         m_code = re.search(r'\["code"\]\s*=\s*"([^"]*)"', sub)
         m_name = re.search(r'\["country"\]\s*=\s*"([^"]*)"', sub)
         if m_name: name_map[idx] = m_name.group(1)
@@ -255,7 +319,6 @@ def _parse_area_codes_from_lua(lua_text: str) -> Tuple[Dict[str,str], Dict[str,s
     return name_map, iso_map
 
 def _load_area_codes_from_rl_path(path: str, verbose: bool=False) -> Tuple[Dict[str,str], Dict[str,str]]:
-    """Load AREA_CODES from a specific RL mod folder or zip."""
     if os.path.isdir(path):
         for root, _dirs, files in os.walk(path):
             for fn in files:
@@ -281,23 +344,18 @@ def _load_area_codes_from_rl_path(path: str, verbose: bool=False) -> Tuple[Dict[
     return {}, {}
 
 def load_area_codes_from_rl(mods_dir: str, verbose: bool=False) -> Tuple[Dict[str,str], Dict[str,str], List[str]]:
-    """Search mods_dir for RL (folder or zip) and parse AREA_CODES. Returns (name_map, iso_map, checked_paths)."""
     checked = []
     if not os.path.isdir(mods_dir):
         return {}, {}, checked
-
     entries = os.listdir(mods_dir)
     rl_candidates = [e for e in entries if _looks_like_rl_mod(e)]
     scan_order = rl_candidates + [e for e in entries if e not in rl_candidates]
-
     for entry in scan_order:
         p = os.path.join(mods_dir, entry)
         checked.append(p)
         names, isos = _load_area_codes_from_rl_path(p, verbose=verbose)
         if names:
             return names, isos, checked
-
-    # brute zip scan fallback
     for entry in entries:
         p = os.path.join(mods_dir, entry)
         if os.path.isfile(p) and p.lower().endswith(".zip"):
@@ -312,7 +370,6 @@ def load_area_codes_from_rl(mods_dir: str, verbose: bool=False) -> Tuple[Dict[st
                             return names, isos, checked
             except Exception:
                 pass
-
     return {}, {}, checked
 
 def _load_country_map_json(path: Optional[str]) -> Dict[str, str]:
@@ -327,15 +384,12 @@ def _load_country_map_json(path: Optional[str]) -> Dict[str, str]:
 
 def _country_lookup(code_raw: str, name_map: Dict[str,str], iso_map: Dict[str,str], json_map: Dict[str,str]) -> Tuple[str,str]:
     if not code_raw: return "", ""
-    # JSON override first
     if code_raw in json_map: return json_map[code_raw], ""
     try:
         as_int = str(int(float(code_raw)))
         if as_int in json_map: return json_map[as_int], ""
     except Exception:
         pass
-    # RL mapping
-    key = None
     try: key = str(int(float(code_raw)))
     except Exception: key = code_raw
     name = name_map.get(key, "")
@@ -345,7 +399,6 @@ def _country_lookup(code_raw: str, name_map: Dict[str,str], iso_map: Dict[str,st
     return (name or f"Unknown ({code_raw})", iso)
 
 # ---------- Core parsing ----------
-
 def safe_float(x: str) -> Optional[float]:
     try:
         return float(x)
@@ -361,7 +414,7 @@ def derive_age_days(months_str: str) -> str:
 
 def derive_age_years(months_str: str) -> str:
     m = safe_float(months_str)
-    return fmt_num(m/12.0) if m is not None else ""
+    return f"{m/12.0:.2f}" if m is not None else ""
 
 def derive_due_date(y: str, m: str, d: str, duration_str: str) -> str:
     try:
@@ -385,7 +438,6 @@ def parse_placeables(placeables_path: str,
     except Exception as e:
         print(f"[error] Failed to parse {placeables_path}: {e}", file=sys.stderr)
         return [], []
-
     root = tree.getroot()
     animals_rows: List[Dict[str,str]] = []
     fetuses_rows: List[Dict[str,str]] = []
@@ -405,9 +457,8 @@ def parse_placeables(placeables_path: str,
             species = infer_species(plc, shed_file, animal)
             if species_filter and species and (species not in species_filter):
                 continue
-            if farmid_filter:
-                if _get_attr(animal, "farmId") != str(farmid_filter):
-                    continue
+            if farmid_filter and _get_attr(animal, "farmId") != str(farmid_filter):
+                continue
 
             row = {k: "" for k in ANIMAL_COLUMNS}
             row["placeable_id"] = placeable_id
@@ -497,7 +548,6 @@ def parse_placeables(placeables_path: str,
     return animals_rows, fetuses_rows
 
 # ---------- Summaries ----------
-
 def _to_float(x: str) -> Optional[float]:
     try:
         if x == "" or x is None: return None
@@ -552,7 +602,6 @@ def summarize(animals_rows: List[Dict[str,str]]) -> List[Dict[str,str]]:
     return summary_rows
 
 # ---------- IO helpers ----------
-
 def ensure_dir_for(path: str):
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
@@ -566,6 +615,18 @@ def write_csv(path: str, cols: List[str], rows: List[Dict[str,str]]):
         for r in rows:
             w.writerow({k: r.get(k, "") for k in cols})
 
+def _format_date_columns(ws, columns: List[str], date_cols: set):
+    """Apply Excel date number_format to cells that actually contain dates."""
+    if not date_cols: return
+    for col_name in date_cols:
+        if col_name not in columns: continue
+        col_idx = columns.index(col_name) + 1  # 1-based
+        for row in range(2, ws.max_row + 1):  # skip header
+            cell = ws.cell(row=row, column=col_idx)
+            # only format true date objects (text stays as text)
+            if isinstance(cell.value, date):
+                cell.number_format = "yyyy-mm-dd"
+
 def write_xlsx(path: str, animals: List[Dict[str,str]], fetuses: List[Dict[str,str]], summary: List[Dict[str,str]]):
     if not OPENPYXL_OK:
         print("[warn] openpyxl not installed; writing CSVs instead.", file=sys.stderr)
@@ -574,30 +635,40 @@ def write_xlsx(path: str, animals: List[Dict[str,str]], fetuses: List[Dict[str,s
         write_csv(base + "_fetuses.csv", FETUS_COLUMNS, fetuses)
         write_csv(base + "_summary.csv", SUMMARY_COLUMNS, summary)
         return
+
     ensure_dir_for(path)
-    from openpyxl import Workbook  # safe import here too
     wb = Workbook()
+
     # Animals
     ws = wb.active; ws.title = "Animals"
     ws.append(ANIMAL_COLUMNS)
     for r in animals:
-        ws.append([r.get(k, "") for k in ANIMAL_COLUMNS])
+        ws.append(_cast_for_sheet(r, ANIMAL_COLUMNS, ANIMAL_INT_COLS, ANIMAL_FLOAT_COLS, ANIMAL_DATE_COLS))
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(ANIMAL_COLUMNS))}{ws.max_row}"
+    ws.freeze_panes = "A2"
+    _format_date_columns(ws, ANIMAL_COLUMNS, ANIMAL_DATE_COLS)
+
     # Fetuses
     ws2 = wb.create_sheet("Fetuses")
     ws2.append(FETUS_COLUMNS)
     for r in fetuses:
-        ws2.append([r.get(k, "") for k in FETUS_COLUMNS])
+        ws2.append(_cast_for_sheet(r, FETUS_COLUMNS, FETUS_INT_COLS, FETUS_FLOAT_COLS, FETUS_DATE_COLS))
+    ws2.auto_filter.ref = f"A1:{get_column_letter(len(FETUS_COLUMNS))}{ws2.max_row}"
+    ws2.freeze_panes = "A2"
+    _format_date_columns(ws2, FETUS_COLUMNS, FETUS_DATE_COLS)
+
     # Summary
     ws3 = wb.create_sheet("Summary")
     ws3.append(SUMMARY_COLUMNS)
     for r in summary:
-        ws3.append([r.get(k, "") for k in SUMMARY_COLUMNS])
+        ws3.append(_cast_for_sheet(r, SUMMARY_COLUMNS, SUMMARY_INT_COLS, SUMMARY_FLOAT_COLS, SUMMARY_DATE_COLS))
+    ws3.auto_filter.ref = f"A1:{get_column_letter(len(SUMMARY_COLUMNS))}{ws3.max_row}"
+    ws3.freeze_panes = "A2"
+
     wb.save(path)
 
 # ---------- Save iteration ----------
-
 def list_saves(fs_root: str) -> List[str]:
-    # Find subfolders named savegame* that contain placeables.xml
     out = []
     for name in sorted(os.listdir(fs_root)):
         if not name.lower().startswith("savegame"): continue
@@ -607,7 +678,6 @@ def list_saves(fs_root: str) -> List[str]:
     return out
 
 # ---------- CLI & main ----------
-
 def resolve_save_dir(save_arg: str) -> str:
     cand = os.path.abspath(save_arg)
     if os.path.isdir(cand): return cand
@@ -616,7 +686,7 @@ def resolve_save_dir(save_arg: str) -> str:
 def run_for_save(save_dir: str,
                  out_csv: Optional[str],
                  xlsx_path: Optional[str],
-                 summary_out: Optional[str],
+                 summary_out_path: Optional[str],
                  country_json_path: Optional[str],
                  rl_path: Optional[str],
                  species_filter_list: Optional[List[str]],
@@ -638,11 +708,14 @@ def run_for_save(save_dir: str,
         else:
             mods_dir = find_mods_dir(os.getcwd(), verbose=verbose)
             if verbose: print(f"[info] scanning mods dir: {mods_dir}")
-            name_map, iso_map, checked = load_area_codes_from_rl(mods_dir, verbose=verbose)
+            load_names, load_isos, checked = load_area_codes_from_rl(mods_dir, verbose=verbose)
+            name_map, iso_map = load_names, load_isos
             if verbose and not name_map:
                 print("[warn] RealisticLivestock.lua with AREA_CODES not found.")
                 if checked:
-                    print("[info] paths checked:"); [print("  -", p) for p in checked]
+                    print("[info] paths checked:")
+                    for p in checked:
+                        print("  -", p)
 
     animals, fetuses = parse_placeables(
         placeables_path,
@@ -651,7 +724,6 @@ def run_for_save(save_dir: str,
     )
     summary = summarize(animals)
 
-    # Outputs
     save_name = os.path.basename(save_dir.rstrip("/\\"))
     if xlsx_path:
         xlsx = xlsx_path
@@ -662,11 +734,11 @@ def run_for_save(save_dir: str,
     else:
         animals_out = out_csv or os.path.join(save_dir, "livestock.csv")
         fetuses_out = os.path.splitext(animals_out)[0] + "_fetuses.csv"
-        summary_out = summary_out or os.path.join(save_dir, "livestock_summary.csv")
+        summary_csv = summary_out_path or os.path.join(save_dir, "livestock_summary.csv")
         write_csv(animals_out, ANIMAL_COLUMNS, animals)
         write_csv(fetuses_out, FETUS_COLUMNS, fetuses)
-        write_csv(summary_out, SUMMARY_COLUMNS, summary)
-        print(f"[ok] {save_name}: wrote {animals_out}, {fetuses_out}, {summary_out}")
+        write_csv(summary_csv, SUMMARY_COLUMNS, summary)
+        print(f"[ok] {save_name}: wrote {animals_out}, {fetuses_out}, {summary_csv}")
 
 def main():
     ap = argparse.ArgumentParser(description="Export FS2025 livestock (+genetics, pregnancy, summaries, Excel).")
@@ -702,14 +774,14 @@ def main():
         if not saves:
             print("[info] no savegame* folders with placeables.xml found here.")
             return
-        # If --xlsx is given with "", build per-save default paths; if it's a non-empty path, use that as a directory.
+        # If --xlsx has "", build per-save defaults; if it's a non-empty path, treat as directory unless it ends with .xlsx
         xlsx_is_dir = None
         xlsx_root = None
         if args.xlsx is not None:
             if args.xlsx == "":
                 xlsx_is_dir = False
             else:
-                if args.xlsx.endswith(os.sep) or (os.path.isdir(args.xlsx) or args.xlsx.lower().endswith(".xlsx") is False):
+                if args.xlsx.endswith(os.sep) or (os.path.isdir(args.xlsx) or not args.xlsx.lower().endswith(".xlsx")):
                     xlsx_is_dir = True
                     xlsx_root = args.xlsx
         for sdir in saves:
